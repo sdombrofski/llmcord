@@ -1,15 +1,16 @@
 import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime as dt
 import logging
 from typing import Any, Literal, Optional
+import json
+import re
 
 import discord
 from discord.app_commands import Choice
 from discord.ext import commands
 import httpx
-from openai import AsyncOpenAI
 import yaml
 
 logging.basicConfig(
@@ -24,9 +25,11 @@ EMBED_COLOR_COMPLETE = discord.Color.dark_green()
 EMBED_COLOR_INCOMPLETE = discord.Color.orange()
 
 STREAMING_INDICATOR = " ⚪"
-EDIT_DELAY_SECONDS = 1
+EDIT_DELAY_SECONDS = 3
 
 MAX_MESSAGE_NODES = 500
+DISCORD_MAX_MESSAGE_LENGTH = 2000  # Discord's maximum message content length (plain text)
+DISCORD_MAX_EMBED_DESCRIPTION = 4096  # Discord's maximum embed description length
 
 
 def get_config(filename: str = "config.yaml") -> dict[str, Any]:
@@ -97,9 +100,87 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
 @discord_bot.event
 async def on_ready() -> None:
     if client_id := config["client_id"]:
-        logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317273088&scope=bot\n")
+        logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/api/oauth2/authorize?client_id={client_id}&permissions=412317273088&scope=bot\n")
 
     await discord_bot.tree.sync()
+
+
+def convert_messages_for_ollama(messages):
+    """Convert OpenAI format messages to Ollama format"""
+    ollama_messages = []
+    
+    for msg in messages:
+        if msg["role"] == "system":
+            # Ollama doesn't have system role, we'll prepend to first user message
+            continue
+            
+        # Handle content that could be string or list (for images)
+        content = msg["content"]
+        if isinstance(content, list):
+            # Extract text from complex content
+            text_parts = []
+            for part in content:
+                if part.get("type") == "text":
+                    text_parts.append(part["text"])
+            content = "\n".join(text_parts) if text_parts else ""
+        
+        ollama_messages.append({
+            "role": msg["role"],
+            "content": content
+        })
+    
+    return ollama_messages
+
+
+def remove_thinking_sections(text):
+    """Remove thinking sections from model responses"""
+    # Remove content between <thinking> and </thinking> tags
+    text = re.sub(r'<thinking>.*?</thinking>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Remove content between <think> and </think> tags
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Remove "Let me think..." style thinking patterns
+    text = re.sub(r'^(Let me think.*?\n\n)', '', text, flags=re.MULTILINE | re.IGNORECASE)
+    text = re.sub(r'^(I need to think.*?\n\n)', '', text, flags=re.MULTILINE | re.IGNORECASE)
+    text = re.sub(r'^(Thinking.*?\n\n)', '', text, flags=re.MULTILINE | re.IGNORECASE)
+    
+    # Remove reasoning chains that start with "First," "Step 1:", etc.
+    # but only if they appear at the beginning and are followed by actual response
+    lines = text.split('\n')
+    cleaned_lines = []
+    skip_reasoning = False
+    
+    for i, line in enumerate(lines):
+        line_lower = line.lower().strip()
+        
+        # Check if this line starts a reasoning section
+        if any(line_lower.startswith(pattern) for pattern in [
+            'first,', 'step 1:', 'let me analyze', 'let me break', 
+            'to answer this', 'i should consider', 'thinking through'
+        ]):
+            skip_reasoning = True
+            continue
+            
+        # Check if we've reached the actual answer
+        if skip_reasoning and any(line_lower.startswith(pattern) for pattern in [
+            'the answer', 'in conclusion', 'therefore', 'so,', 'thus,', 
+            'my response', 'to summarize', 'simply put'
+        ]):
+            skip_reasoning = False
+            cleaned_lines.append(line)
+            continue
+            
+        if not skip_reasoning:
+            cleaned_lines.append(line)
+    
+    # Clean up extra whitespace
+    result = '\n'.join(cleaned_lines).strip()
+    
+    # Remove multiple consecutive newlines
+    result = re.sub(r'\n\s*\n\s*\n+', '\n\n', result)
+    
+    return result
 
 
 @discord_bot.event
@@ -139,9 +220,12 @@ async def on_message(new_msg: discord.Message) -> None:
     provider, model = provider_slash_model.split("/", 1)
     model_parameters = config["models"].get(provider_slash_model, None)
 
-    base_url = config["providers"][provider]["base_url"]
-    api_key = config["providers"][provider].get("api_key", "sk-no-key-required")
-    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+    # Hardcode Ollama host URL
+    if provider == "ollama":
+        base_url = "http://0.0.0.0:11434"
+    else:
+        # Get base URL without /v1 for direct Ollama API
+        base_url = config["providers"][provider]["base_url"].replace("/v1", "")
 
     accept_images = any(x in model.lower() for x in VISION_MODEL_TAGS)
     accept_usernames = any(x in provider_slash_model.lower() for x in PROVIDERS_SUPPORTING_USERNAMES)
@@ -232,17 +316,19 @@ async def on_message(new_msg: discord.Message) -> None:
 
     logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
 
-    if system_prompt := config["system_prompt"]:
-        now = datetime.now().astimezone()
-
-        system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
+    # Prepare system prompt
+    system_prompt = ""
+    if config.get("system_prompt"):
+        system_prompt_extras = [f"Today's date: {dt.now().strftime('%B %d %Y')}."]
         if accept_usernames:
-            system_prompt += "\nUser's names are their Discord IDs and should be typed as '<@ID>'."
+            system_prompt_extras.append("User's names are their Discord IDs and should be typed as '<@ID>'.")
+        system_prompt = "\n".join([config["system_prompt"]] + system_prompt_extras)
 
-        messages.append(dict(role="system", content=system_prompt))
+    # Convert messages for Ollama
+    ollama_messages = convert_messages_for_ollama(messages[::-1])
 
     # Generate and send response message(s) (can be multiple if response is long)
-    curr_content = finish_reason = edit_task = None
+    curr_content = ""
     response_msgs = []
     response_contents = []
 
@@ -255,64 +341,107 @@ async def on_message(new_msg: discord.Message) -> None:
 
     try:
         async with new_msg.channel.typing():
-            async for curr_chunk in await openai_client.chat.completions.create(model=model, messages=messages[::-1], stream=True, extra_body=model_parameters):
-                if finish_reason != None:
-                    break
+            # Prepare Ollama chat request
+            payload = {
+                "model": model,
+                "messages": ollama_messages,
+                "stream": True
+            }
+            
+            if system_prompt:
+                payload["system"] = system_prompt
+            
+            if model_parameters:
+                payload.update(model_parameters)
 
-                finish_reason = curr_chunk.choices[0].finish_reason
+            edit_task = None
+            
+            async with httpx_client.stream('POST', f"{base_url}/api/chat", json=payload) as response:
+                if response.status_code != 200:
+                    raise Exception(f"Ollama API error: {response.status_code}")
+                
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                        
+                    try:
+                        data = json.loads(line)
+                        
+                        if data.get("done", False):
+                            break
+                            
+                        if "message" in data and "content" in data["message"]:
+                            chunk_content = data["message"]["content"]
+                            curr_content += chunk_content
 
-                prev_content = curr_content or ""
-                curr_content = curr_chunk.choices[0].delta.content or ""
+                            if response_contents == [] or len(response_contents[-1] + curr_content) > max_message_length:
+                                response_contents.append("")
 
-                new_content = prev_content if finish_reason == None else (prev_content + curr_content)
+                            response_contents[-1] = curr_content
 
-                if response_contents == [] and new_content == "":
-                    continue
+                            if not use_plain_responses:
+                                ready_to_edit = (edit_task == None or edit_task.done()) and dt.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
+                                is_final_edit = data.get("done", False)
+                                # Only update if we have enough content or it's the final edit
+                                has_enough_content = len(curr_content) >= 50  # Wait for at least 50 characters
+                                
+                                if (len(response_contents) == 1 or (ready_to_edit and has_enough_content) or is_final_edit):
+                                    if edit_task != None:
+                                        try:
+                                            await edit_task
+                                        except discord.HTTPException:
+                                            # If we hit rate limit, just continue
+                                            pass
 
-                if start_next_msg := response_contents == [] or len(response_contents[-1] + new_content) > max_message_length:
-                    response_contents.append("")
+                                    # Remove thinking sections before displaying
+                                    display_content = remove_thinking_sections(curr_content) if is_final_edit else curr_content
+                                    
+                                    # Truncate content to fit Discord's limits with larger buffer
+                                    truncated_content = display_content[:DISCORD_MAX_EMBED_DESCRIPTION-len(STREAMING_INDICATOR)-50] if not is_final_edit else display_content[:DISCORD_MAX_EMBED_DESCRIPTION-50]
+                                    if len(display_content) > len(truncated_content):
+                                        truncated_content += "..." if is_final_edit else "..."
+                                    
+                                    embed.description = truncated_content if is_final_edit else (truncated_content + STREAMING_INDICATOR)
+                                    embed.color = EMBED_COLOR_COMPLETE if is_final_edit else EMBED_COLOR_INCOMPLETE
 
-                response_contents[-1] += new_content
+                                    if len(response_msgs) == 0:
+                                        response_msg = await new_msg.reply(embed=embed, silent=True)
+                                        response_msgs.append(response_msg)
+                                        msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+                                        await msg_nodes[response_msg.id].lock.acquire()
+                                    else:
+                                        try:
+                                            edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
+                                        except discord.HTTPException:
+                                            # If we hit rate limit, skip this update
+                                            pass
 
-                if not use_plain_responses:
-                    ready_to_edit = (edit_task == None or edit_task.done()) and datetime.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
-                    is_final_edit = finish_reason != None or msg_split_incoming
-                    is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
-
-                    if start_next_msg or ready_to_edit or is_final_edit:
-                        if edit_task != None:
-                            await edit_task
-
-                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                        embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
-
-                        if start_next_msg:
-                            reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
-                            response_msg = await reply_to_msg.reply(embed=embed, silent=True)
-                            response_msgs.append(response_msg)
-
-                            msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
-                            await msg_nodes[response_msg.id].lock.acquire()
-                        else:
-                            edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
-
-                        last_task_time = datetime.now().timestamp()
+                                    last_task_time = dt.now().timestamp()
+                                    
+                    except json.JSONDecodeError:
+                        continue
 
             if use_plain_responses:
-                for content in response_contents:
-                    reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
-                    response_msg = await reply_to_msg.reply(content=content, suppress_embeds=True)
-                    response_msgs.append(response_msg)
-
-                    msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
-                    await msg_nodes[response_msg.id].lock.acquire()
+                reply_to_msg = new_msg
+                # Remove thinking sections before sending
+                cleaned_content = remove_thinking_sections(curr_content)
+                # Truncate content to fit Discord's 2000 character limit with buffer
+                truncated_content = cleaned_content[:DISCORD_MAX_MESSAGE_LENGTH-50]  # Increased buffer
+                if len(cleaned_content) > len(truncated_content):
+                    truncated_content += "..."
+                response_msg = await reply_to_msg.reply(content=truncated_content, suppress_embeds=True)
+                response_msgs.append(response_msg)
+                msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+                await msg_nodes[response_msg.id].lock.acquire()
 
     except Exception:
         logging.exception("Error while generating response")
 
+    # Clean the final content before storing
+    final_cleaned_content = remove_thinking_sections(curr_content)
+    
     for response_msg in response_msgs:
-        msg_nodes[response_msg.id].text = "".join(response_contents)
+        msg_nodes[response_msg.id].text = final_cleaned_content
         msg_nodes[response_msg.id].lock.release()
 
     # Delete oldest MsgNodes (lowest message IDs) from the cache
@@ -326,7 +455,4 @@ async def main() -> None:
     await discord_bot.start(config["bot_token"])
 
 
-try:
-    asyncio.run(main())
-except KeyboardInterrupt:
-    pass
+asyncio.run(main())
