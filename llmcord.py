@@ -48,7 +48,7 @@ intents.message_content = True
 activity = discord.CustomActivity(name=(config["status_message"] or "github.com/jakobdylanc/llmcord")[:128])
 discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=None)
 
-httpx_client = httpx.AsyncClient()
+httpx_client = httpx.AsyncClient(timeout=60.0)
 
 
 @dataclass
@@ -220,12 +220,8 @@ async def on_message(new_msg: discord.Message) -> None:
     provider, model = provider_slash_model.split("/", 1)
     model_parameters = config["models"].get(provider_slash_model, None)
 
-    # Hardcode Ollama host URL
-    if provider == "ollama":
-        base_url = "http://0.0.0.0:11434"
-    else:
-        # Get base URL without /v1 for direct Ollama API
-        base_url = config["providers"][provider]["base_url"].replace("/v1", "")
+    # Get base URL without /v1 for direct Ollama API
+    base_url = config["providers"][provider]["base_url"].replace("/v1", "")
 
     accept_images = any(x in model.lower() for x in VISION_MODEL_TAGS)
     accept_usernames = any(x in provider_slash_model.lower() for x in PROVIDERS_SUPPORTING_USERNAMES)
